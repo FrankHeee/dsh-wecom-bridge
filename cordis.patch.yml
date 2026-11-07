@@ -1,0 +1,17 @@
+# dsh-wecom-bridge bundle layer: inserts the WeCom Source plugin and the session-title refiner.
+#
+# The WeCom Source needs a BotID and Secret of an 企业微信智能机器人 whose API mode is
+# "长连接" (long connection). It connects outbound to wss://openws.work.weixin.qq.com, so no
+# public callback URL is required. The title refiner keeps session titles short and topical and
+# never overwrites a title a person set by hand.
+- insert:
+    - id: dsh-wecom-bridge
+      name: dsh-wecom-bridge
+    - id: dsh-wecom-watch
+      name: dsh-wecom-bridge/wecom-watch
+    - id: dsh-wecom-title-refiner
+      name: dsh-wecom-bridge
+      config:
+        enabled: true
+        everyMessages: 8
+        minIntervalMs: 1800000

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "name": "dsh-wecom-bridge",
+    "description": "通过 WebSocket 长连接把企业微信智能机器人接入 dsh-superagent，并附带会话标题提炼。"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "name": "dsh-wecom-bridge",
+    "description": "A WeCom (企业微信) smart-robot Source for dsh-superagent over a WebSocket long connection, plus a session-title refiner."
+  }
+}
