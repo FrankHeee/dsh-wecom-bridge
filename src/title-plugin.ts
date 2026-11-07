@@ -52,6 +52,17 @@ function recentUserMessages(events: readonly TitleEvent[]): { role: string; text
   return messages.slice(-20)
 }
 
+/** 取会话里第一条人消息的文本。 */
+function firstMessageText(events: readonly TitleEvent[]): string | undefined {
+  for (const event of events) {
+    if (event.type !== 'user/message') continue
+    const data = event.data as { message?: { content?: { type: string; text?: string }[] } } | undefined
+    const text = (data?.message?.content ?? []).map(block => block.text ?? '').join('').trim()
+    if (text.length > 0) return text
+  }
+  return undefined
+}
+
 /** 会话日志事件的最小形状。 */
 interface LoggedEvent extends TitleEvent {
   data?: { title?: string; source?: { kind?: string }; message?: { role?: string; content?: { type: string; text?: string }[] } }
@@ -99,6 +110,15 @@ export function apply(ctx: Context, config: TitleRefinerConfig): void {
       const titleState = foldTitle(events)
       // 人手动改过标题的会话不动。
       if (!mayRefine(titleState)) { state.lastRefinedAt = Date.now(); state.messages = 0; return }
+      // 标题里混进了模型的思维链：先用首句消息修好，再继续。
+      if (isPolluted(titleState.title)) {
+        const first = firstMessageText(events)
+        if (first) {
+          const repaired = normalizeTitle(first.replace(/^headless\s+/i, '').slice(0, resolved.maxChars), resolved.maxChars)
+          await ctx.sessionController.rename({ sessionId, title: repaired })
+          ctx.logger.warn('dsh-wecom: 修好了被思维链污染的标题「%s」', repaired)
+        }
+      }
       const messages = recentUserMessages(events)
       if (messages.length === 0) return
       const output = await askModel(messages)
