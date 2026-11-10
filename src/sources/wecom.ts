@@ -8,7 +8,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import { key, type ChannelRef, type Trigger } from './dsh-superagent-core.ts'
 import {
-  eventType, extractText, isEvent, isMessage, parseFrame, pingFrame, PING_INTERVAL_MS,
+  eventType, extractText, isEvent, isMessage, isSubscribeAck, parseFrame, pingFrame, PING_INTERVAL_MS,
   reqId, respondFrame, stripMention, subscribeFrame, welcomeFrame, WS_URL,
   type Frame, type MessageBody,
 } from '../wecom-protocol.ts'
@@ -93,13 +93,23 @@ export class WeComClient {
   private socket?: import('ws').WebSocket
   private timer?: NodeJS.Timeout
   private closed = false
+  /** 本次连接订阅帧的 req_id；回执按它对号入座，其他帧的 errcode 不算订阅结果。 */
+  private subscribeReqId?: string
+  /** 是否已收到订阅成功的回执；收到回执之前连接不算可用。 */
+  private subscribeAcked = false
   /** msgid → 原始消息体；回复时要用它的 req_id 和 msgid。 */
   private readonly pending = new Map<string, { body: MessageBody; reqId: string }>()
 
   constructor(private readonly config: WeComConfig,
     private readonly onMessage: (body: MessageBody, reqId: string) => void,
     private readonly onEvent: (type: string, reqId: string) => void,
-    private readonly log: (message: string) => void) {}
+    private readonly log: (message: string) => void,
+    private readonly onSubscribe?: (errcode: number, errmsg: string | undefined) => void) {}
+
+  /** 是否已收到订阅成功的回执；健康状态以此为准。 */
+  get subscribed(): boolean {
+    return this.subscribeAcked
+  }
 
   /** 建立连接并订阅。 */
   connect(): void {
@@ -111,12 +121,23 @@ export class WeComClient {
       this.socket = socket
       socket.on('open', () => {
         this.log('企业微信长连接已建立')
-        this.send(subscribeFrame(this.config.botId, this.config.secret))
-        this.timer = setInterval(() => this.send(pingFrame()), PING_INTERVAL_MS)
+        this.subscribeAcked = false
+        this.subscribeReqId = reqId('sub')
+        try {
+          this.send(subscribeFrame(this.config.botId, this.config.secret, this.subscribeReqId))
+        } catch (error) {
+          this.log(`订阅帧发送失败：${String(error)}`)
+        }
+        this.timer = setInterval(() => {
+          // 心跳帧发不出去说明连接正在关闭，close 事件会负责重连，这里不抛。
+          try { this.send(pingFrame()) } catch { /* 连接正在关闭 */ }
+        }, PING_INTERVAL_MS)
       })
       socket.on('message', (raw: Buffer | string) => this.onRaw(raw.toString()))
       socket.on('close', () => {
         this.log('企业微信长连接已断开')
+        this.subscribeAcked = false
+        this.subscribeReqId = undefined
         this.clearTimer()
         if (!this.closed) setTimeout(() => this.connect(), this.config.reconnectDelayMs)
       })
@@ -131,22 +152,26 @@ export class WeComClient {
     this.socket?.close()
   }
 
-  /** 发送一帧。 */
+  /** 发送一帧；连接未就绪时抛错，绝不静默丢弃，让调用方知道没发出去。 */
   send(frame: Frame): void {
-    if (this.socket?.readyState !== 1) return
+    if (this.socket?.readyState !== 1) throw new Error('企业微信长连接未就绪，帧未发送')
     this.socket.send(JSON.stringify(frame))
   }
 
-  /** 回复一条消息：流式刷新同一条消息，最后 finish。 */
+  /** 回复一条消息：流式刷新同一条消息，最后 finish。连接未就绪时 send 的错会穿透出去。 */
   reply(msgid: string, content: string, finish = true): void {
     const entry = this.pending.get(msgid)
     if (!entry) return
     this.send(respondFrame(entry.reqId, `s-${msgid}`, content, finish))
   }
 
-  /** 发送欢迎语。 */
+  /** 发送欢迎语；欢迎语只是尽力而为，连接刚断开时记日志而不是抛错。 */
   welcome(reqId: string, content: string): void {
-    this.send(welcomeFrame(reqId, content))
+    try {
+      this.send(welcomeFrame(reqId, content))
+    } catch (error) {
+      this.log(`欢迎语发送失败：${String(error)}`)
+    }
   }
 
   /** 取出一条消息的回复目标；测试和诊断用。 */
@@ -162,6 +187,19 @@ export class WeComClient {
   private onRaw(raw: string): void {
     const frame = parseFrame(raw)
     if (!frame) return
+    // 订阅回执：无 cmd、带 errcode、且 req_id 与本次订阅帧一致的才是订阅结果；
+    // 健康状态以它为准，回执到达之前不算订阅成功。
+    if (this.subscribeReqId !== undefined && frame.cmd === undefined
+      && frame.headers?.req_id === this.subscribeReqId && typeof frame.errcode === 'number') {
+      if (isSubscribeAck(frame)) {
+        this.subscribeAcked = true
+        this.onSubscribe?.(0, undefined)
+      } else if (frame.errcode !== 0) {
+        this.log(`企业微信订阅失败：errcode ${frame.errcode}${frame.errmsg ? `：${frame.errmsg}` : ''}`)
+        this.onSubscribe?.(frame.errcode, frame.errmsg)
+      }
+      return
+    }
     if (isMessage(frame)) {
       const body = frame.body as MessageBody | undefined
       const req = frame.headers?.req_id
@@ -217,12 +255,17 @@ export const wecomKind = {
       const body = { chattype: address.chattype === 'group' ? 'group' : 'single', chatid: address.chatId } as MessageBody
       return inScope(body, config)
     },
-    /** 回复走同一条长连接；消息体由 WeComClient 按 msgid 找回。 */
+    /**
+     * 回复走同一条长连接；消息体由 WeComClient 按 msgid 找回。
+     * 回复目标已不存在时返回 'gone'；连接未就绪时 reply 抛错，
+     * 由引擎按「这次没送达、可以重试」处理，绝不谎报 'sent'。
+     */
     async send(_host: unknown, message: { channel: ChannelRef; text: string }): Promise<'sent' | 'gone'> {
       const client = currentClient
       if (!client) return 'gone'
       const msgid = message.channel.address.msgid
       if (!msgid) return 'gone'
+      if (!client.target(msgid)) return 'gone'
       client.reply(msgid, message.text, true)
       return 'sent'
     },
@@ -298,7 +341,6 @@ async function runWeCom(ctx: Context, signal: AbortSignal): Promise<void> {
         (body, req) => {
           if (!inScope(body, config)) return
           const trigger = wecomTrigger(body)
-          source.report('wecom', { state: 'ready', detail: '长连接已建立' })
           void source.receive(trigger)
           void req
         },
@@ -306,13 +348,17 @@ async function runWeCom(ctx: Context, signal: AbortSignal): Promise<void> {
           if (type === 'enter_chat') client.welcome(req, '在的，直接说需求或问题就行。')
           if (type === 'disconnected_event') log('长连接被新连接踢下线，等待重连')
         },
-        log)
+        log,
+        (errcode, errmsg) => {
+          // 健康状态以订阅回执为准：errcode 0 才算 ready，非 0 明确报 error 并带上 errcode。
+          if (errcode === 0) {
+            source.report('wecom', { state: 'ready', detail: '企业微信长连接已建立' })
+          } else {
+            source.report('wecom', { state: 'error', detail: `企业微信订阅失败：errcode ${errcode}${errmsg ? `：${errmsg}` : ''}` })
+          }
+        })
       currentClient = client
       client.connect()
-      // 连接建立后上报健康状态；连接失败时由 onError 回调补充。
-      setTimeout(() => {
-        source.report('wecom', { state: 'ready', detail: '企业微信长连接已建立' })
-      }, 2000)
       signal.addEventListener('abort', () => { client.close(); resolve() }, { once: true })
     })
     await delay(1000, undefined, { signal }).catch(() => {})
